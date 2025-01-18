@@ -1,0 +1,2537 @@
+// File: backend/server.js
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+const app = express();
+app.use(cors({
+    origin: process.env.NODE_ENV === 'production' 
+      ? 'https://your-production-domain.com' 
+      : 'http://localhost:5173',
+    credentials: true
+  }));
+  app.use(express.json());
+const PORT = 5555;
+const JWT_SECRET = 'your-secret-key-here'; // Replace with a secure secret key
+
+// Middleware for parsing JSON
+app.use(bodyParser.json());
+
+
+// Database setup
+const db = new sqlite3.Database('./app.db', (err) => {
+    if (err) {
+      console.error('Error opening database:', err.message);
+    } else {
+      console.log('Connected to the database.');
+      createTables();
+    }
+  });
+  
+  function createTables() {
+    db.run(`
+      CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          fullName TEXT NOT NULL,
+          email TEXT UNIQUE NOT NULL,
+          password TEXT NOT NULL,
+          resetToken TEXT,
+          resetTokenExpiry INTEGER
+      )
+    `, (err) => {
+        if(err) {
+            console.error('Error creating users table:', err.message)
+        } else {
+            console.log('Users table created or already exists')
+            seedDatabase();
+        }
+    })
+  }
+
+async function seedDatabase() {
+    db.get("SELECT COUNT(*) AS count FROM users", (err, row) => {
+        if (err) {
+            console.error('Error checking users table:', err.message);
+            return;
+        }
+        if (row.count === 0) {
+            const hashedPassword = bcrypt.hashSync('password123', 10)
+            const dummyUser = {
+                fullName: 'Dummy User',
+                email: 'dummy@example.com',
+                password: hashedPassword
+            };
+
+            db.run(`INSERT INTO users (fullName, email, password) VALUES (?, ?, ?)`, [dummyUser.fullName, dummyUser.email, dummyUser.password], (err) => {
+                if (err) {
+                   console.error('Error seeding the user:', err.message);
+                } else {
+                    console.log('Database seeded with a dummy user')
+                }
+            })
+        } else {
+            console.log('Database already seeded, no changes required')
+        }
+    })
+}
+
+  
+// Authentication Middleware
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+  
+    if (token == null) return res.sendStatus(401);
+  
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+      if (err) return res.sendStatus(403);
+      req.user = user;
+      next();
+    });
+  }
+
+
+// Authentication Routes
+
+// server.js - modify login and register routes
+
+// Login route
+app.post('/api/auth/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+        if(err) {
+           return res.status(500).json({ message: 'Internal Server Error' });
+        }
+        if(!user){
+            return res.status(401).json({ message: 'Incorrect credentials'})
+        }
+
+        const passwordMatch = await bcrypt.compare(password, user.password);
+        if(!passwordMatch){
+            return res.status(401).json({ message: 'Incorrect credentials'})
+        }
+
+        const token = jwt.sign({ id: user.id, email: user.email}, JWT_SECRET, {expiresIn: '1h'})
+        // Return user data along with token
+        res.json({ 
+            token,
+            user: {
+                id: user.id,
+                email: user.email,
+                fullName: user.fullName
+            }
+        });
+    })
+});
+
+// Register route
+app.post('/api/auth/register', async (req, res) => {
+    const { fullName, email, password } = req.body;
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    db.run('INSERT INTO users (fullName, email, password) VALUES (?,?,?)', [fullName, email, hashedPassword], function(err) {
+        if (err) {
+            if (err.errno === 19) {
+               return res.status(400).json({ message: 'User with this email already exists'});
+            }
+            return res.status(500).json({ message: 'Internal server error'});
+        }
+        const token = jwt.sign({ id: this.lastID, email}, JWT_SECRET, {expiresIn: '1h'})
+        // Return user data along with token
+        res.json({ 
+            token,
+            user: {
+                id: this.lastID,
+                email,
+                fullName
+            }
+        });
+    });
+});
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+    const { email } = req.body;
+
+    crypto.randomBytes(20, (err, buffer) => {
+        if (err) {
+            return res.status(500).json({ message: 'Internal server error'});
+        }
+
+        const token = buffer.toString('hex');
+        const now = Date.now();
+        const expiryTime = now + 3600000; // 1 Hour
+
+        db.run(`UPDATE users SET resetToken = ?, resetTokenExpiry = ? WHERE email = ?`, [token, expiryTime, email], function(err){
+           if(err){
+              return res.status(500).json({ message: 'Internal server error'});
+           }
+           if(this.changes === 0) {
+            return res.status(404).json({ message: 'User not found'});
+           }
+           // TODO: Send the email with the token link here
+           res.json({ message: 'Password reset email sent'});
+        });
+    });
+});
+
+app.post('/api/auth/reset-password', async(req, res) => {
+    const { token, password } = req.body;
+
+    db.get('SELECT * FROM users WHERE resetToken = ? AND resetTokenExpiry > ?', [token, Date.now()], async (err, user) => {
+      if(err) {
+        return res.status(500).json({ message: 'Internal Server error'});
+      }
+      if(!user) {
+        return res.status(400).json({ message: 'Invalid or expired token'})
+      }
+
+      const hashedPassword = await bcrypt.hash(password, 10);
+      db.run('UPDATE users SET password = ?, resetToken = NULL, resetTokenExpiry = NULL WHERE id = ?', [hashedPassword, user.id], (err) => {
+         if (err){
+           return res.status(500).json({ message: 'Internal server error'});
+         }
+         res.json({ message: 'Password reset successful'});
+      });
+    });
+});
+
+
+// User Routes
+app.get('/api/user', authenticateToken, (req, res) => {
+    db.get('SELECT id, fullName, email FROM users WHERE id = ?', [req.user.id], (err, row) => {
+        if (err) {
+           return res.status(500).json({ message: 'Internal server error'});
+        }
+        if (!row) {
+            return res.status(404).json({ message: 'User not found'});
+        }
+
+        res.json(row);
+    })
+});
+
+
+app.put('/api/user', authenticateToken, async(req, res) => {
+  const { fullName, email } = req.body;
+  
+  // Build the update query dynamically
+    let updateQuery = 'UPDATE users SET ';
+    const updateValues = [];
+    
+    if (fullName) {
+      updateQuery += 'fullName = ?, ';
+      updateValues.push(fullName);
+    }
+    if (email) {
+        updateQuery += 'email = ?, ';
+        updateValues.push(email);
+    }
+    
+    // Remove trailing comma and space if there are updates
+    if (updateValues.length > 0) {
+        updateQuery = updateQuery.slice(0, -2); // Remove ", "
+        updateQuery += ' WHERE id = ?';
+    }
+    else {
+        return res.status(400).json({message: "No fields to update"})
+    }
+
+
+    db.run(updateQuery, [...updateValues, req.user.id], function(err) {
+        if (err) {
+            return res.status(500).json({ message: 'Internal server error' });
+        }
+        if (this.changes === 0){
+           return res.status(404).json({ message: 'User not found'});
+        }
+        res.json({ message: 'User updated successfully' });
+    })
+});
+
+
+// Password Update Route
+app.put('/api/user/password', authenticateToken, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+
+  if (!currentPassword || !newPassword) {
+        return res.status(400).json({ message: 'Both currentPassword and newPassword are required' });
+  }
+  
+  db.get('SELECT password FROM users WHERE id = ?', [req.user.id], async (err, row) => {
+    if (err) {
+      return res.status(500).json({ message: 'Internal server error' });
+    }
+    if (!row) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+      // Verify current password
+      const isPasswordValid = await bcrypt.compare(currentPassword, row.password)
+        if (!isPasswordValid){
+            return res.status(401).json({ message: "Invalid Current Password"});
+        }
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    db.run('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, req.user.id], function(err) {
+      if (err) {
+        return res.status(500).json({ message: 'Internal server error' });
+      }
+      if (this.changes === 0) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      res.json({ message: 'Password updated successfully' });
+    });
+  });
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+});
+// File: project/eslint.config.js
+import js from '@eslint/js';
+import globals from 'globals';
+import reactHooks from 'eslint-plugin-react-hooks';
+import reactRefresh from 'eslint-plugin-react-refresh';
+import tseslint from 'typescript-eslint';
+
+export default tseslint.config(
+  { ignores: ['dist'] },
+  {
+    extends: [js.configs.recommended, ...tseslint.configs.recommended],
+    files: ['**/*.{ts,tsx}'],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+    plugins: {
+      'react-hooks': reactHooks,
+      'react-refresh': reactRefresh,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      'react-refresh/only-export-components': [
+        'warn',
+        { allowConstantExport: true },
+      ],
+    },
+  }
+);
+
+// File: project/index.html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + React + TS</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+// File: project/postcss.config.js
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+
+// File: project/src/App.tsx
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import { Provider } from 'react-redux';
+import { store } from './store';
+import Navbar from './components/Navbar';
+import { useDispatch } from 'react-redux';
+import { useEffect } from 'react';
+import { setCredentials } from './store/slices/authSlice';
+import { userApi } from './services/api';
+import { ProtectedRoute } from './components/ProtectedRoute';
+
+const Home = React.lazy(() => import('./pages/Home'));
+const About = React.lazy(() => import('./pages/About'));
+const Login = React.lazy(() => import('./pages/Login'));
+const Register = React.lazy(() => import('./pages/Register'));
+const ForgotPassword = React.lazy(() => import('./pages/ForgotPassword'));
+const Profile = React.lazy(() => import('./pages/Profile'));
+const Translate = React.lazy(() => import('./pages/Translate'));
+
+function AppContent() {
+ const dispatch = useDispatch();
+
+ useEffect(() => {
+   const initializeAuth = async () => {
+     const token = localStorage.getItem('token');
+     if (token) {
+       try {
+         const userData = await userApi.getProfile();
+         dispatch(setCredentials({ user: userData, token }));
+       } catch (error) {
+        console.log(error)
+       }
+     }
+   };
+
+   initializeAuth();
+ }, [dispatch]);
+
+ return (
+   <div className="min-h-screen bg-gray-50">
+     <Navbar />
+     <React.Suspense
+       fallback={
+         <div className="flex items-center justify-center min-h-screen">
+           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+         </div>
+       }
+     >
+       <Routes>
+         <Route path="/" element={<Home />} />
+         <Route path="/about" element={<About />} />
+         <Route path="/login" element={<Login />} />
+         <Route path="/register" element={<Register />} />
+         <Route path="/forgot-password" element={<ForgotPassword />} />
+         <Route 
+           path="/profile" 
+           element={
+             <ProtectedRoute>
+               <Profile />
+             </ProtectedRoute>
+           } 
+         />
+         <Route 
+           path="/translate" 
+           element={
+             <ProtectedRoute>
+               <Translate />
+             </ProtectedRoute>
+           } 
+         />
+       </Routes>
+     </React.Suspense>
+   </div>
+ );
+}
+
+function App() {
+ return (
+   <Provider store={store}>
+     <Router>
+       <AppContent />
+     </Router>
+   </Provider>
+ );
+}
+
+export default App;
+// File: project/src/components/Carousel.css
+.carousel-container {
+    position: relative;
+    max-width: 600px;
+    height: 451px;
+    overflow: hidden;
+    border: 2px solid #ccc;
+    border-radius: 8px;
+  }
+  
+  .carousel-slide {
+    display: flex;
+    transition: transform 0.5s ease-in-out;
+  }
+  
+  .carousel-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  
+  .carousel-btn {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    background: rgba(0, 0, 0, 0.5);
+    color: white;
+    border: none;
+    padding: 10px;
+    cursor: pointer;
+    z-index: 3;
+  }
+  
+  .prev-btn {
+    left: 10px;
+  }
+  
+  .next-btn {
+    right: 10px;
+  }
+  
+// File: project/src/components/Carousel.jsx
+import React, { useState, useEffect } from 'react';
+import './Carousel.css';
+
+const Carousel = ({ images }) => {
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [isTransitioning, setIsTransitioning] = useState(false);
+
+  // Auto-slide effect
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      handleNext();
+    }, 3000);
+
+    return () => clearInterval(intervalId);
+  }, [images.length]);
+
+  const handleNext = () => {
+    if (isTransitioning) return;
+    setIsTransitioning(true);
+    setTimeout(() => {
+      setCurrentIndex((prevIndex) => (prevIndex + 1) % (images.length));
+      setIsTransitioning(false);
+    }, 500); // Match the CSS transition duration
+  };
+
+  const handlePrev = () => {
+    if (isTransitioning) return;
+    setIsTransitioning(true);
+    setTimeout(() => {
+      setCurrentIndex((prevIndex) =>
+        prevIndex === 0 ? images.length - 1 : prevIndex - 1
+      );
+      setIsTransitioning(false);
+    }, 500); // Match the CSS transition duration
+  };
+
+  return (
+    <div className="carousel-container">
+      {/* <button className="carousel-btn prev-btn" onClick={handlePrev}>
+        ❮
+      </button> */}
+      <div className="carousel-slide" style={{ transform: `translateX(-${currentIndex * 100}%)` }}>
+        {images.map((image, index) => (
+          <img
+            key={index}
+            src={image}
+            alt={`Carousel Item ${index + 1}`}
+            className={`carousel-image`}
+          />
+        ))}
+      </div>
+      {/* <button className="carousel-btn next-btn" onClick={handleNext}>
+        ❯
+      </button> */}
+    </div>
+  );
+};
+
+export default Carousel;
+
+// File: project/src/components/Detect.css
+.signlang_detection-container {
+  display: flex;
+  justify-content: space-evenly;
+  align-items: center;
+  font-family: var(--font-family);
+}
+
+.signlang_webcam {
+  width: 600px;
+  height: 500px;
+  z-index: 999;
+}
+
+.signlang_canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 600px;
+  height: 500px;
+  z-index: 999;
+}
+
+.signlang_data-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-direction: column;
+  text-align: center;
+}
+
+.signlang_data-container .signlang_data {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  padding: 0 1rem;
+}
+
+.signlang_data-container button {
+  width: 100px;
+  height: 30px;
+  font-size: 20px;
+  font-weight: 500;
+  border: none;
+  outline: none;
+  background-color: var(--color-subtext);
+  color: #fff;
+  font-family: var(--font-family);
+  border-radius: 8px;
+}
+
+.signlang_data-container p {
+  font-size: 20px;
+  margin: 1rem;
+  width: 20%;
+  display: flex;
+  justify-content: flex-start;
+}
+
+.gesture_output {
+  color: var(--color-subtext);
+  width: 100%;
+}
+
+.signlang_imagelist-container h2 {
+  /* color: var(--color-subtext); */
+  font-size: 25px;
+  text-transform: uppercase;
+  text-align: center;
+  letter-spacing: 5px;
+}
+
+.signlang_image-div {
+  width: 100%;
+  height: 550px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 1rem;
+}
+
+
+.signlang_image-div img {
+  width: 400px;
+  height: 300px;
+  margin-bottom: 8rem;
+}
+
+.signlang_image-div button {
+  width: 50%;
+  background-color: inherit;
+  outline: none;
+  border: none;
+  color: var(--color-subtext);
+  cursor: pointer;
+  font-size: 20px;
+}
+
+.signlang_imagelist-container h3 {
+  margin-bottom: 10rem;
+  line-height: 2;
+}
+
+
+.signlang_detection_notLoggedIn{
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-direction: column;
+  margin: 2rem;
+}
+
+.signlang_detection_notLoggedIn h1{
+  letter-spacing: 5px;
+  font-weight: 800;
+}
+
+.signlang_detection_notLoggedIn p{
+  color: #fff;
+  font-size: 1rem;
+  text-align: center;
+  width: 60%;
+  letter-spacing: 2px;
+  font-weight: bold;
+}
+
+.signlang_detection_notLoggedIn img{
+  width: 600px;
+  height: 400px;
+  object-fit: contain;
+  margin: 1rem 0;
+  border-radius: 8px;
+}
+
+@media screen and (max-width: 1080px) {
+  .signlang_webcam {
+    width: 550px;
+    height: 500px;
+  }
+
+  .signlang_canvas {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 550px;
+    height: 500px;
+  }
+
+  .signlang_image-div {
+    width: fit-content;
+    height: 400px;
+  }
+
+  .signlang_image-div img {
+    width: 300px;
+    height: 300px;
+  }
+}
+
+@media screen and (max-width: 990px) {
+  .signlang_detection-container {
+    flex-direction: column;
+  }
+
+  .signlang_detection_notLoggedIn img{
+    width: 500px;
+    height: 300px;
+  }
+}
+
+@media screen and (max-width: 550px) {
+
+    .signlang_webcam {
+        width: 100%;
+        height: fit-content;
+    }
+      
+    .signlang_canvas {
+        width: 100%;
+        height: fit-content;
+    }
+
+    .signlang_image-div {
+        width: fit-content;
+        height: 300px;
+    }
+
+    .signlang_image-div img {
+        width: 200px;
+        height: 150px;
+    }
+
+    .signlang_imagelist-container h3 {
+      text-align: center;
+    }
+
+    .signlang_data-container .signlang_data {
+      padding: 0 0.5rem;
+    }
+
+    .signlang_data-container p {
+      font-size: 18px;
+      width: 30%;
+    }
+
+    .signlang_detection_notLoggedIn img{
+      width: 300px;
+      height: 300px;
+      margin: 0;
+    }
+
+    .signlang_detection_notLoggedIn p{
+      font-size: 0.8rem;
+      width: 100%;
+    }
+    
+
+  }
+  
+// File: project/src/components/Detect.jsx
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import "./Detect.css";
+import { v4 as uuidv4 } from "uuid";
+import { FilesetResolver, GestureRecognizer } from "@mediapipe/tasks-vision";
+import {
+  drawConnectors,
+  drawLandmarks,
+  // HAND_CONNECTIONS,
+} from "@mediapipe/drawing_utils";
+import { HAND_CONNECTIONS } from "@mediapipe/hands";
+import Webcam from "react-webcam";
+import { useDispatch, useSelector } from "react-redux";
+import { motion } from "framer-motion";
+import Carousel from "./Carousel";
+
+import Yes from './SignImages/IMG-20250110-WA0002.jpg'
+import Pen from './SignImages/IMG-20250110-WA0003.jpg'
+import Name from './SignImages/IMG-20250110-WA0004.jpg'
+import NotOK from './SignImages/IMG-20250110-WA0005.jpg'
+
+let startTime = "";
+
+const myImages = [
+  Yes,
+  Pen,
+  Name,
+  NotOK,
+  "https://i0.wp.com/glazermuseum.org/wp-content/uploads/2020/06/ASL-alphabet.png?resize=1080%2C835&ssl=1"
+];
+
+const Detect = () => {
+  const webcamRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [webcamRunning, setWebcamRunning] = useState(false);
+  // const [gestureOutput, setGestureOutput] = useState("");
+  const [gestureRecognizer, setGestureRecognizer] = useState(null);
+  const [runningMode, setRunningMode] = useState("IMAGE");
+  const requestRef = useRef();
+  const [detectedData, setDetectedData] = useState([]);
+  const user = useSelector((state) => state.auth?.user);
+  const dispatch = useDispatch();
+  const [textToDownload, setTextToDownload] = useState("");
+
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedText, setEditedText] = useState("");
+
+  //  useEffect(() => {
+  //      let intervalId;
+  //      if (webcamRunning) {
+  //       intervalId = setInterval(() => {
+  //           const randomIndex = Math.floor(Math.random() * SignImageData.length);
+  //           const randomImage = SignImageData[randomIndex];
+  //           setCurrentImage(randomImage);
+  //       }, 5000);
+  //       }
+  //       return () => clearInterval(intervalId);
+  //   }, [webcamRunning]);
+
+  if (
+    process.env.NODE_ENV === "development" ||
+    process.env.NODE_ENV === "production"
+  ) {
+    console.log = function () {};
+  }
+
+  const predictWebcam = useCallback(() => {
+    if (runningMode === "IMAGE") {
+      setRunningMode("VIDEO");
+      gestureRecognizer.setOptions({ runningMode: "VIDEO" });
+    }
+
+    let nowInMs = Date.now();
+    const results = gestureRecognizer.recognizeForVideo(
+      webcamRef.current.video,
+      nowInMs
+    );
+
+    const canvasCtx = canvasRef.current.getContext("2d");
+    canvasCtx.save();
+    canvasCtx.clearRect(
+      0,
+      0,
+      canvasRef.current.width,
+      canvasRef.current.height
+    );
+
+    const videoWidth = webcamRef.current.video.videoWidth;
+    const videoHeight = webcamRef.current.video.videoHeight;
+
+    // Set video width
+    webcamRef.current.video.width = videoWidth;
+    webcamRef.current.video.height = videoHeight;
+
+    // Set canvas height and width
+    canvasRef.current.width = videoWidth;
+    canvasRef.current.height = videoHeight;
+
+    // Draw the results on the canvas, if any.
+    if (results.landmarks) {
+      for (const landmarks of results.landmarks) {
+        drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {
+          color: "#00FF00",
+          lineWidth: 5,
+        });
+
+        drawLandmarks(canvasCtx, landmarks, { color: "#FF0000", lineWidth: 2 });
+      }
+    }
+    if (results.gestures.length > 0) {
+      const detectedGesture = results.gestures[0][0].categoryName;
+      setDetectedData((prevData) => [
+        ...prevData,
+        { SignDetected: detectedGesture },
+      ]);
+
+      handleChangeText(detectedGesture);
+    }
+
+    if (webcamRunning) {
+      setTimeout(() => {
+        requestRef.current = requestAnimationFrame(predictWebcam);
+      }, 1000);
+    }
+  }, [webcamRunning, runningMode, gestureRecognizer]);
+
+  const animate = useCallback(() => {
+    requestRef.current = requestAnimationFrame(animate);
+    predictWebcam();
+  }, [predictWebcam]);
+
+  const enableCam = useCallback(() => {
+    if (!gestureRecognizer) {
+      alert("Please wait for gestureRecognizer to load");
+      return;
+    }
+
+    if (webcamRunning === true) {
+      setWebcamRunning(false);
+      cancelAnimationFrame(requestRef.current);
+      setCurrentImage(null);
+
+      const endTime = new Date();
+
+      const timeElapsed = (
+        (endTime.getTime() - startTime.getTime()) /
+        1000
+      ).toFixed(2);
+
+      // Remove empty values
+      const nonEmptyData = detectedData.filter(
+        (data) => data.SignDetected !== "" && data.DetectedScore !== ""
+      );
+
+      //to filter continous same signs in an array
+      const resultArray = [];
+      let current = nonEmptyData[0];
+
+      for (let i = 1; i < nonEmptyData.length; i++) {
+        if (nonEmptyData[i].SignDetected !== current.SignDetected) {
+          resultArray.push(current);
+          current = nonEmptyData[i];
+        }
+      }
+
+      resultArray.push(current);
+
+      //calculate count for each repeated sign
+      const countMap = new Map();
+
+      for (const item of resultArray) {
+        const count = countMap.get(item.SignDetected) || 0;
+        countMap.set(item.SignDetected, count + 1);
+      }
+
+      const sortedArray = Array.from(countMap.entries()).sort(
+        (a, b) => b[1] - a[1]
+      );
+
+      const outputArray = sortedArray
+        .slice(0, 5)
+        .map(([sign, count]) => ({ SignDetected: sign, count }));
+
+      // object to send to action creator
+      const data = {
+        signsPerformed: outputArray,
+        id: uuidv4(),
+        username: user?.name,
+        userId: user?.userId,
+        createdAt: String(endTime),
+        secondsSpent: Number(timeElapsed),
+      };
+
+      dispatch(addSignData(data));
+      setDetectedData([]);
+    } else {
+      setWebcamRunning(true);
+      startTime = new Date();
+      requestRef.current = requestAnimationFrame(animate);
+    }
+  }, [
+    webcamRunning,
+    gestureRecognizer,
+    animate,
+    detectedData,
+    user?.name,
+    user?.userId,
+    dispatch,
+  ]);
+
+  const handleDownload = () => {
+    const blob = new Blob([textToDownload], { type: "text/plain" }); // create blob
+    const url = URL.createObjectURL(blob); // create temp URL
+    const a = document.createElement("a"); // create anchor tag
+    a.href = url; // set URL to blob
+    a.download = "translation.txt"; // file name
+    document.body.appendChild(a);
+    a.click(); // trigger download
+    URL.revokeObjectURL(url); // revoke object URL
+    document.body.removeChild(a); // clean up
+  };
+
+  const handleChangeText = (newGesture) => {
+    setTextToDownload((prevText) => {
+      const lastGesture = prevText.split(" ").pop(); // Get the last gesture from the text
+      if (lastGesture !== newGesture) {
+        return prevText + " " + newGesture;
+      }
+      return prevText; // Don't append if it's the same as the last one
+    });
+  };
+
+  useEffect(() => {
+    async function loadGestureRecognizer() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+      const recognizer = await GestureRecognizer.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "./Trained Model/sign_language_recognizer_25-04-2023.task",
+        },
+        numHands: 2,
+        runningMode: runningMode,
+      });
+      setGestureRecognizer(recognizer);
+    }
+    loadGestureRecognizer();
+  }, [runningMode]);
+
+  const handleInput = (e) => {
+    setEditedText(e.target.textContent);
+  };
+
+  const handleEdit = () => setIsEditing(true);
+  const handleDone = () => {
+    setTextToDownload(editedText);
+    setIsEditing(false);
+  };
+
+  return (
+    <>
+      <div className="signlang_detection-container">
+        <>
+          <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+            <motion.h1
+              className="text-3xl font-bold text-gray-900 mb-6"
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5 }}
+            >
+              Translate
+            </motion.h1>
+            <motion.div
+              className="bg-white shadow overflow-hidden sm:rounded-lg p-6"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, delay: 0.2 }}
+            >
+              <div className="mb-4"></div>
+              <div className="flex flex-col md:flex-row space-y-4 md:space-y-0 md:space-x-4">
+                <motion.div
+                  className="w-full md:w-1/2"
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ duration: 0.5, delay: 0.4 }}
+                >
+                  <h2 className="text-lg font-medium text-gray-900 mb-2">
+                    Camera Feed
+                  </h2>
+                  <div className="relative bg-gray-200 rounded-lg overflow-hidden">
+                    <div>
+                      <Webcam audio={false} ref={webcamRef} />
+
+                      <canvas ref={canvasRef} className="signlang_canvas" />
+                    </div>
+                    {!webcamRunning && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 text-white">
+                        <p>Click 'Start Translation' to begin</p>
+                      </div>
+                    )}
+                  </div>
+                </motion.div>
+                <motion.div
+                  className="w-full md:w-1/2"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ duration: 0.5, delay: 0.6 }}
+                >
+                  <h2 className="text-lg font-medium text-gray-900 mb-2">
+                    Translated Text
+                  </h2>
+                  <div className="flex flex-col justify-center">
+                    <div
+                      className="bg-gray-100 p-4 h-64 overflow-y-auto rounded-lg"
+                      contentEditable={isEditing} // Only set contentEditable to true when isEditing is true
+                      suppressContentEditableWarning
+                      onInput={isEditing ? handleInput : undefined} // Set onInput only if isEditing is true
+                    >
+                      {textToDownload || "Translation will appear here..."}
+                    </div>
+                    <button
+                      className="mt-4 x-4 py-2 bg-blue-600 text-white rounded-lg"
+                      onClick={isEditing ? handleDone : handleEdit}
+                    >
+                      {isEditing ? "Done" : "Edit"}
+                    </button>
+                  </div>
+                </motion.div>
+              </div>
+            </motion.div>
+
+            <div style={{ display: "flex", justifyContent: "center" }}>
+              <button
+                className="m-4 px-4 py-2 bg-blue-600 text-white rounded-lg"
+                onClick={enableCam}
+              >
+                {webcamRunning ? "Stop" : "Start"}
+              </button>
+              <button
+                className="m-4 px-4 py-2 bg-blue-600 text-white rounded-lg"
+                onClick={() => setTextToDownload("")}
+              >
+                Clear
+              </button>
+              <button
+                className="m-4 px-4 py-2 bg-blue-600 text-white rounded-lg"
+                onClick={handleDownload}
+              >
+                Download
+              </button>
+            </div>
+          </div>
+        </>
+      </div>
+      <div className="flex justify-center m-4">
+        <div className="flex flex-col">
+          <p className="text-center">Try These Gestures:</p>
+          <Carousel images={myImages} />
+        </div>
+      </div>
+    </>
+  );
+};
+
+export default Detect;
+
+// File: project/src/components/Navbar.tsx
+import React, { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { Menu, X, LogOut } from 'lucide-react';
+import { useDispatch, useSelector } from 'react-redux';
+import { RootState } from '../store';
+import { logout } from '../store/slices/authSlice';
+
+export default function Navbar() {
+  const [isOpen, setIsOpen] = useState(false);
+  const navigate = useNavigate();
+  const dispatch = useDispatch();
+  const [state, authState] = useState(false)
+  const { user } = useSelector((state: RootState) => state.auth);
+
+  const handleLogout = () => {
+    dispatch(logout());
+    navigate('/login');
+  };
+
+  useEffect((  )=>{
+    if(localStorage.getItem('token')){
+      authState(true)
+    }
+    else authState(false)
+  },[user])
+  
+  return (
+    <nav className="bg-white shadow-lg">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex justify-between h-16">
+          <div className="flex">
+            <Link to="/" className="flex items-center">
+              <span className="text-xl font-bold text-gray-800">SignLang Translator</span>
+            </Link>
+          </div>
+
+          {/* Desktop menu */}
+          <div className="hidden md:flex items-center space-x-4">
+            <Link to="/" className="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md">
+              Home
+            </Link>
+            <Link to="/about" className="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md">
+              About
+            </Link>
+            {state ? (
+              <>
+                <Link to="/translate" className="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md">
+                  Translate
+                </Link>
+                <Link to="/profile" className="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md">
+                  Profile
+                </Link>
+                <button
+                  onClick={handleLogout}
+                  className="flex items-center text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md"
+                >
+                  <LogOut className="w-5 h-5 mr-1" />
+                  Logout
+                </button>
+              </>
+            ) : (
+              <>
+                <Link to="/login" className="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md">
+                  Login
+                </Link>
+                <Link
+                  to="/register"
+                  className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700"
+                >
+                  Register
+                </Link>
+              </>
+            )}
+          </div>
+
+          {/* Mobile menu button */}
+          <div className="md:hidden flex items-center">
+            <button
+              onClick={() => setIsOpen(!isOpen)}
+              className="inline-flex items-center justify-center p-2 rounded-md text-gray-700 hover:text-gray-900 focus:outline-none"
+            >
+              {isOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile menu */}
+      {isOpen && (
+        <div className="md:hidden">
+          <div className="px-2 pt-2 pb-3 space-y-1 sm:px-3">
+            <Link
+              to="/"
+              className="block text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md"
+              onClick={() => setIsOpen(false)}
+            >
+              Home
+            </Link>
+            <Link
+              to="/about"
+              className="block text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md"
+              onClick={() => setIsOpen(false)}
+            >
+              About
+            </Link>
+            {state ? (
+              <>
+                <Link
+                  to="/translate"
+                  className="block text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md"
+                  onClick={() => setIsOpen(false)}
+                >
+                  Translate
+                </Link>
+                <Link
+                  to="/profile"
+                  className="block text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md"
+                  onClick={() => setIsOpen(false)}
+                >
+                  Profile
+                </Link>
+                <button
+                  onClick={() => {
+                    handleLogout();
+                    setIsOpen(false);
+                  }}
+                  className="flex items-center w-full text-left text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md"
+                >
+                  <LogOut className="w-5 h-5 mr-1" />
+                  Logout
+                </button>
+              </>
+            ) : (
+              <>
+                <Link
+                  to="/login"
+                  className="block text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md"
+                  onClick={() => setIsOpen(false)}
+                >
+                  Login
+                </Link>
+                <Link
+                  to="/register"
+                  className="block bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700"
+                  onClick={() => setIsOpen(false)}
+                >
+                  Register
+                </Link>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </nav>
+  );
+}
+// File: project/src/components/ProtectedRoute.tsx
+// components/ProtectedRoute.tsx
+import { Navigate } from 'react-router-dom';
+
+export const ProtectedRoute = ({ children }: { children: React.ReactNode }) => {
+  const token = localStorage.getItem('token');
+  
+  if (!token) {
+    return <Navigate to="/login" />;
+  }
+
+  return <>{children}</>;
+};
+// File: project/src/index.css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 1s ease-out forwards;
+}
+
+@layer base {
+  body {
+    @apply antialiased text-gray-900;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center px-6 py-3 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 transition-colors duration-300;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center px-6 py-3 rounded-lg bg-gray-200 text-gray-800 font-semibold hover:bg-gray-300 transition-colors duration-300;
+  }
+
+  .input-field {
+    @apply w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors duration-200;
+  }
+
+  .form-label {
+    @apply block text-sm font-medium text-gray-700 mb-1;
+  }
+}
+
+.aspect-w-16 {
+  position: relative;
+  padding-bottom: 56.25%;
+}
+
+.aspect-w-16 > * {
+  position: absolute;
+  height: 100%;
+  width: 100%;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+}
+// File: project/src/main.tsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);
+// File: project/src/pages/About.tsx
+import React from 'react';
+import { Link } from 'react-router-dom';
+import { ArrowRight, Heart, Globe, Users, Shield } from 'lucide-react';
+
+const ValueCard: React.FC<{
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+}> = ({ icon, title, description }) => (
+  <div className="bg-white p-6 rounded-xl shadow-lg hover:shadow-xl transition-all duration-300">
+    <div className="text-blue-600 mb-4">{icon}</div>
+    <h3 className="text-xl font-semibold mb-2 text-gray-800">{title}</h3>
+    <p className="text-gray-600">{description}</p>
+  </div>
+);
+
+export default function About() {
+  return (
+    <div className="min-h-screen">
+      {/* Hero Section */}
+      <section className="relative bg-gradient-to-br from-blue-600 to-purple-700 text-white py-24">
+        <div className="absolute inset-0 bg-[url('https://images.unsplash.com/photo-1521791136064-7986c2920216?auto=format&fit=crop&q=80')] opacity-10 bg-cover bg-center" />
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 relative">
+          <div className="max-w-3xl">
+            <h1 className="text-4xl md:text-5xl font-bold mb-6">
+              Our Mission to Break Down Barriers
+            </h1>
+            <p className="text-xl text-blue-100 mb-8">
+              We're dedicated to making communication accessible to everyone through innovative technology and community collaboration.
+            </p>
+            <Link
+              to="/register"
+              className="inline-flex items-center px-8 py-3 rounded-full bg-white text-blue-600 font-semibold hover:bg-blue-50 transition-colors duration-300"
+            >
+              Join Our Mission
+              <ArrowRight className="ml-2 h-5 w-5" />
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      {/* Values Section */}
+      <section className="py-24 bg-gray-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="text-center mb-16">
+            <h2 className="text-3xl md:text-4xl font-bold text-gray-900 mb-4">
+              Our Core Values
+            </h2>
+            <p className="text-xl text-gray-600 max-w-2xl mx-auto">
+              These principles guide everything we do in our mission to make communication accessible to everyone.
+            </p>
+          </div>
+
+          <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-8">
+            <ValueCard
+              icon={<Heart className="h-8 w-8" />}
+              title="Empathy"
+              description="We put ourselves in our users' shoes to understand their needs and challenges."
+            />
+            <ValueCard
+              icon={<Globe className="h-8 w-8" />}
+              title="Accessibility"
+              description="Making our platform accessible to everyone, regardless of their background."
+            />
+            <ValueCard
+              icon={<Users className="h-8 w-8" />}
+              title="Community"
+              description="Building a supportive community that helps and learns from each other."
+            />
+            <ValueCard
+              icon={<Shield className="h-8 w-8" />}
+              title="Privacy"
+              description="Protecting our users' data and privacy is our top priority."
+            />
+          </div>
+        </div>
+      </section>
+
+      {/* Story Section */}
+      <section className="py-24 bg-white">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="grid lg:grid-cols-2 gap-12 items-center">
+            <div>
+              <h2 className="text-3xl font-bold text-gray-900 mb-6">
+                Our Story
+              </h2>
+              <div className="space-y-4 text-lg text-gray-600">
+                <p>
+                  Founded with a vision to bridge communication gaps, our platform leverages cutting-edge AI technology to make sign language translation accessible to everyone.
+                </p>
+                <p>
+                  What started as a small project has grown into a global platform, helping thousands of people communicate effectively across language barriers.
+                </p>
+                <p>
+                  Today, we continue to innovate and improve our technology, working closely with the deaf community to ensure our platform meets their needs and expectations.
+                </p>
+              </div>
+            </div>
+            <div className="relative">
+              <div className="aspect-w-16 aspect-h-9 rounded-xl overflow-hidden shadow-xl">
+                <img
+                  src="https://images.unsplash.com/photo-1573497620053-ea5300f94f21?auto=format&fit=crop&q=80"
+                  alt="Team collaboration"
+                  className="object-cover w-full h-full"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* CTA Section */}
+      <section className="bg-gray-50 py-24">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="bg-gradient-to-r from-blue-600 to-purple-600 rounded-2xl overflow-hidden shadow-xl">
+            <div className="relative px-6 py-16 sm:px-12 sm:py-20">
+              <div className="relative max-w-3xl mx-auto text-center">
+                <h2 className="text-3xl font-extrabold text-white sm:text-4xl">
+                  Be Part of Our Journey
+                </h2>
+                <p className="mt-4 text-lg text-blue-100">
+                  Join us in making communication accessible to everyone, everywhere.
+                </p>
+                <Link
+                  to="/register"
+                  className="mt-8 inline-flex items-center px-8 py-3 rounded-full bg-white text-blue-600 font-semibold hover:bg-blue-50 transition-colors duration-300"
+                >
+                  Get Started Now
+                  <ArrowRight className="ml-2 h-5 w-5" />
+                </Link>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+// File: project/src/pages/Home.tsx
+import React from 'react';
+import { Link } from 'react-router-dom';
+import { Users, Globe2, ArrowRight } from 'lucide-react';
+
+const FeatureCard: React.FC<{
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+}> = ({ icon, title, description }) => (
+  <div className="relative group bg-white p-6 rounded-xl shadow-lg hover:shadow-xl transition-all duration-300 transform hover:-translate-y-1">
+    <div className="absolute inset-0 bg-gradient-to-r from-blue-500/10 to-purple-500/10 rounded-xl opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+    <div className="relative">
+      <div className="text-blue-600 mb-4">{icon}</div>
+      <h3 className="text-xl font-semibold mb-2 text-gray-800">{title}</h3>
+      <p className="text-gray-600">{description}</p>
+    </div>
+  </div>
+);
+
+export default function Home() {
+  return (
+    <div className="min-h-screen">
+      {/* Hero Section */}
+      <section className="relative overflow-hidden bg-gradient-to-br from-blue-600 to-purple-700 text-white">
+        <div className="absolute inset-0 bg-[url('https://images.unsplash.com/photo-1516733725897-1aa73b87c8e8?auto=format&fit=crop&q=80')] opacity-10 bg-cover bg-center" />
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-24 relative">
+          <div className="text-center">
+            <h1 className="text-4xl md:text-6xl font-bold mb-6 animate-fade-in">
+              Break Down Communication Barriers
+            </h1>
+            <p className="text-xl md:text-2xl mb-8 text-blue-100 max-w-3xl mx-auto">
+              Transform sign language into text instantly with our advanced AI-powered translation platform.
+            </p>
+            <div className="flex flex-col sm:flex-row gap-4 justify-center">
+              <Link
+                to="/register"
+                className="inline-flex items-center px-8 py-3 rounded-full bg-white text-blue-600 font-semibold hover:bg-blue-50 transition-colors duration-300"
+              >
+                Get Started
+                <ArrowRight className="ml-2 h-5 w-5" />
+              </Link>
+              <Link
+                to="/about"
+                className="inline-flex items-center px-8 py-3 rounded-full bg-blue-500 bg-opacity-20 hover:bg-opacity-30 transition-colors duration-300"
+              >
+                Learn More
+              </Link>
+            </div>
+          </div>
+        </div>
+        <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-b from-transparent to-gray-50" />
+      </section>
+
+      {/* Features Section */}
+      <section className="py-24 bg-gray-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="text-center mb-16">
+            <h2 className="text-3xl md:text-4xl font-bold text-gray-900 mb-4">
+              Why Choose Our Platform?
+            </h2>
+            <p className="text-xl text-gray-600 max-w-2xl mx-auto">
+              Experience the power of AI-driven sign language translation with features designed for accessibility and ease of use.
+            </p>
+          </div>
+
+          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
+            <FeatureCard
+              icon={<Users className="h-8 w-8" />}
+              title="Real-Time Translation"
+              description="Get instant translations from sign language to text using our advanced AI technology."
+            />
+            <FeatureCard
+              icon={<Users className="h-8 w-8" />}
+              title="Community Driven"
+              description="Join our growing community of users helping to improve accessibility for everyone."
+            />
+            <FeatureCard
+              icon={<Globe2 className="h-8 w-8" />}
+              title="Global Access"
+              description="Access our platform from anywhere in the world, breaking down language barriers globally."
+            />
+          </div>
+        </div>
+      </section>
+
+      {/* CTA Section */}
+      <section className="bg-white py-24">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="bg-gradient-to-r from-blue-600 to-purple-600 rounded-2xl overflow-hidden shadow-xl">
+            <div className="relative px-6 py-16 sm:px-12 sm:py-20">
+              <div className="relative max-w-3xl mx-auto text-center">
+                <h2 className="text-3xl font-extrabold text-white sm:text-4xl">
+                  Ready to Get Started?
+                </h2>
+                <p className="mt-4 text-lg text-blue-100">
+                  Join thousands of users who are already breaking down communication barriers.
+                </p>
+                <Link
+                  to="/register"
+                  className="mt-8 inline-flex items-center px-8 py-3 rounded-full bg-white text-blue-600 font-semibold hover:bg-blue-50 transition-colors duration-300"
+                >
+                  Sign Up Now
+                  <ArrowRight className="ml-2 h-5 w-5" />
+                </Link>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+// File: project/src/pages/Login.tsx
+import React, { useState, useEffect } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useDispatch } from 'react-redux';
+import { Eye, EyeOff, LogIn, ArrowRight } from 'lucide-react';
+import { setCredentials } from '../store/slices/authSlice';
+import { authApi } from '../services/api';
+
+export default function Login() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  
+  const dispatch = useDispatch();
+  const navigate = useNavigate();
+
+    useEffect(()=>{
+      if(localStorage.getItem('token'))
+        navigate('/translate')
+    },[])
+
+
+// Login.tsx
+const handleSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+  setError(null);
+  setIsLoading(true);
+
+  try {
+    const data = await authApi.login(email, password);
+    dispatch(setCredentials(data)); // data now contains {user, token}
+    navigate('/translate');
+  } catch (err: any) {
+    setError(err.response?.data?.message || 'Failed to login');
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
+      <div className="sm:mx-auto sm:w-full sm:max-w-md">
+        <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
+          Welcome back
+        </h2>
+        <p className="mt-2 text-center text-sm text-gray-600">
+          Don't have an account?{' '}
+          <Link to="/register" className="font-medium text-blue-600 hover:text-blue-500">
+            Sign up
+          </Link>
+        </p>
+      </div>
+
+      <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
+        <div className="bg-white py-8 px-4 shadow-xl rounded-lg sm:px-10">
+          <form className="space-y-6" onSubmit={handleSubmit}>
+            {error && (
+              <div className="bg-red-50 border-l-4 border-red-400 p-4 mb-4">
+                <div className="flex">
+                  <div className="flex-shrink-0">
+                    <svg className="h-5 w-5 text-red-400" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                    </svg>
+                  </div>
+                  <div className="ml-3">
+                    <p className="text-sm text-red-700">{error}</p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div>
+              <label htmlFor="email" className="form-label">
+                Email address
+              </label>
+              <input
+                id="email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="input-field"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="password" className="form-label">
+                Password
+              </label>
+              <div className="relative">
+                <input
+                  id="password"
+                  name="password"
+                  type={showPassword ? 'text' : 'password'}
+                  autoComplete="current-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="input-field pr-10"
+                />
+                <button
+                  type="button"
+                  className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                  onClick={() => setShowPassword(!showPassword)}
+                >
+                  {showPassword ? (
+                    <EyeOff className="h-5 w-5 text-gray-400" />
+                  ) : (
+                    <Eye className="h-5 w-5 text-gray-400" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div className="flex items-center">
+                <input
+                  id="remember-me"
+                  name="remember-me"
+                  type="checkbox"
+                  className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                />
+                <label htmlFor="remember-me" className="ml-2 block text-sm text-gray-900">
+                  Remember me
+                </label>
+              </div>
+            </div>
+
+            <div>
+              <button
+                type="submit"
+                disabled={isLoading}
+                className="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isLoading ? (
+                  <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                ) : (
+                  <>
+                    <LogIn className="w-5 h-5 mr-2" />
+                    Sign in
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+
+          <div className="mt-6">
+            <div className="relative">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-gray-300"></div>
+              </div>
+              <div className="relative flex justify-center text-sm">
+                <span className="px-2 bg-white text-gray-500">New to our platform?</span>
+              </div>
+            </div>
+
+            <div className="mt-6">
+              <Link
+                to="/register"
+                className="w-full flex justify-center items-center px-4 py-3 border border-transparent rounded-lg shadow-sm text-sm font-medium text-blue-600 bg-blue-50 hover:bg-blue-100"
+              >
+                Create an account
+                <ArrowRight className="ml-2 h-5 w-5" />
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+// File: project/src/pages/Profile.tsx
+import React, { useState } from 'react';
+import { useDispatch, useSelector } from 'react-redux';
+import { RootState } from '../store';
+import { setCredentials } from '../store/slices/authSlice';
+import { userApi } from '../services/api';
+import { Eye, EyeOff, Save, User } from 'lucide-react';
+
+export default function Profile() {
+  const { user } = useSelector((state: RootState) => state.auth);
+  const dispatch = useDispatch();
+
+  const [formData, setFormData] = useState({
+    fullName: user?.fullName || '',
+    email: user?.email || '',
+    currentPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  });
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    setIsLoading(true);
+
+    try {
+      if (formData.newPassword && formData.newPassword !== formData.confirmPassword) {
+        throw new Error('New passwords do not match');
+      }
+
+      const updatedData = await userApi.updateProfile({
+        fullName: formData.fullName,
+        email: formData.email
+      });
+
+      if (formData.newPassword && formData.currentPassword) {
+         await userApi.updatePassword({
+           currentPassword: formData.currentPassword,
+           newPassword: formData.newPassword
+         })
+      }
+
+      dispatch(setCredentials({ user: updatedData, token: localStorage.getItem('token') || '' }));
+      setSuccess('Profile updated successfully');
+      setFormData(prev => ({
+        ...prev,
+        currentPassword: '',
+        newPassword: '',
+        confirmPassword: '',
+      }));
+    } catch (err: any) {
+      setError(err.message || 'Failed to update profile. Please try again.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 py-12">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="max-w-3xl mx-auto">
+          <div className="bg-white shadow-xl rounded-lg overflow-hidden">
+            <div className="px-4 py-5 sm:p-6">
+              <div className="flex items-center space-x-3 mb-6">
+                <div className="h-12 w-12 rounded-full bg-blue-100 flex items-center justify-center">
+                  <User className="h-6 w-6 text-blue-600" />
+                </div>
+                <div>
+                  <h2 className="text-2xl font-bold text-gray-900">Profile Settings</h2>
+                  <p className="text-sm text-gray-500">Update your account information</p>
+                </div>
+              </div>
+
+              <form onSubmit={handleSubmit} className="space-y-6">
+                {error && (
+                  <div className="bg-red-50 border-l-4 border-red-400 p-4">
+                    <div className="flex">
+                      <div className="flex-shrink-0">
+                        <svg className="h-5 w-5 text-red-400" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                        </svg>
+                      </div>
+                      <div className="ml-3">
+                        <p className="text-sm text-red-700">{error}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {success && (
+                  <div className="bg-green-50 border-l-4 border-green-400 p-4">
+                    <div className="flex">
+                      <div className="flex-shrink-0">
+                        <svg className="h-5 w-5 text-green-400" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                        </svg>
+                      </div>
+                      <div className="ml-3">
+                        <p className="text-sm text-green-700">{success}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 gap-6">
+                  <div>
+                    <label htmlFor="fullName" className="form-label">
+                      Full name
+                    </label>
+                    <input
+                      type="text"
+                      name="fullName"
+                      id="fullName"
+                      value={formData.fullName}
+                      onChange={handleChange}
+                      className="input-field"
+                    />
+                  </div>
+
+                  <div>
+                    <label htmlFor="email" className="form-label">
+                      Email address
+                    </label>
+                    <input
+                      type="email"
+                      name="email"
+                      id="email"
+                      value={formData.email}
+                      disabled
+                      className="input-field bg-gray-50 cursor-not-allowed"
+                    />
+                  </div>
+
+                  <div className="border-t border-gray-200 pt-6">
+                    <h3 className="text-lg font-medium text-gray-900 mb-4">Change Password</h3>
+                    
+                    <div className="space-y-4">
+                      <div>
+                        <label htmlFor="currentPassword" className="form-label">
+                          Current password
+                        </label>
+                        <div className="relative">
+                          <input
+                            type={showCurrentPassword ? 'text' : 'password'}
+                            name="currentPassword"
+                            id="currentPassword"
+                            value={formData.currentPassword}
+                            onChange={handleChange}
+                            className="input-field pr-10"
+                          />
+                          <button
+                            type="button"
+                            className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                            onClick={() => setShowCurrentPassword(!showCurrentPassword)}
+                          >
+                            {showCurrentPassword ? (
+                              <EyeOff className="h-5 w-5 text-gray-400" />
+                            ) : (
+                              <Eye className="h-5 w-5 text-gray-400" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label htmlFor="newPassword" className="form-label">
+                          New password
+                        </label>
+                        <div className="relative">
+                          <input
+                            type={showNewPassword ? 'text' : 'password'}
+                            name="newPassword"
+                            id="newPassword"
+                            value={formData.newPassword}
+                            onChange={handleChange}
+                            className="input-field pr-10"
+                          />
+                          <button
+                            type="button"
+                            className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                            onClick={() => setShowNewPassword(!showNewPassword)}
+                          >
+                            {showNewPassword ? (
+                              <EyeOff className="h-5 w-5 text-gray-400" />
+                            ) : (
+                              <Eye className="h-5 w-5 text-gray-400" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label htmlFor="confirmPassword" className="form-label">
+                          Confirm new password
+                        </label>
+                        <div className="relative">
+                          <input
+                            type={showConfirmPassword ? 'text' : 'password'}
+                            name="confirmPassword"
+                            id="confirmPassword"
+                            value={formData.confirmPassword}
+                            onChange={handleChange}
+                            className="input-field pr-10"
+                          />
+                          <button
+                            type="button"
+                            className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                            onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                          >
+                            {showConfirmPassword ? (
+                              <EyeOff className="h-5 w-5 text-gray-400" />
+                            ) : (
+                              <Eye className="h-5 w-5 text-gray-400" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex justify-end">
+                  <button
+                    type="submit"
+                    disabled={isLoading}
+                    className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isLoading ? (
+                      <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                    ) : (
+                      <>
+                        <Save className="w-5 h-5 mr-2" />
+                        Save changes
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+// File: project/src/pages/Register.tsx
+import React, { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useDispatch } from 'react-redux';
+import { Eye, EyeOff, UserPlus } from 'lucide-react';
+import { setCredentials } from '../store/slices/authSlice';
+import { authApi } from '../services/api';
+
+export default function Register() {
+  const [formData, setFormData] = useState({
+    fullName: '',
+    email: '',
+    password: '',
+    confirmPassword: '',
+  });
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const dispatch = useDispatch();
+  const navigate = useNavigate();
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({ ...prev, [name]: value }));
+  };
+
+
+  useEffect(()=>{
+    if(localStorage.getItem('token'))
+      navigate('/translate')
+  },[])
+
+// Register.tsx  
+const handleSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+  setError(null);
+
+  if (formData.password !== formData.confirmPassword) {
+    setError('Passwords do not match');
+    return;
+  }
+
+  setIsLoading(true);
+
+  try {
+    const data = await authApi.register(
+      formData.fullName,
+      formData.email,
+      formData.password
+    );
+    dispatch(setCredentials(data)); // data now contains {user, token}
+    navigate('/translate');
+  } catch (err: any) {
+    setError(err.response?.data?.message || 'Failed to register');
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
+      <div className="sm:mx-auto sm:w-full sm:max-w-md">
+        <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
+          Create your account
+        </h2>
+        <p className="mt-2 text-center text-sm text-gray-600">
+          Already have an account?{' '}
+          <Link to="/login" className="font-medium text-blue-600 hover:text-blue-500">
+            Sign in
+          </Link>
+        </p>
+      </div>
+
+      <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
+        <div className="bg-white py-8 px-4 shadow-xl rounded-lg sm:px-10">
+          <form className="space-y-6" onSubmit={handleSubmit}>
+            {error && (
+              <div className="bg-red-50 border-l-4 border-red-400 p-4">
+                <div className="flex">
+                  <div className="flex-shrink-0">
+                    <svg className="h-5 w-5 text-red-400" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                    </svg>
+                  </div>
+                  <div className="ml-3">
+                    <p className="text-sm text-red-700">{error}</p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div>
+              <label htmlFor="fullName" className="form-label">
+                Full name
+              </label>
+              <input
+                id="fullName"
+                name="fullName"
+                type="text"
+                autoComplete="name"
+                required
+                value={formData.fullName}
+                onChange={handleChange}
+                className="input-field"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="email" className="form-label">
+                Email address
+              </label>
+              <input
+                id="email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                value={formData.email}
+                onChange={handleChange}
+                className="input-field"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="password" className="form-label">
+                Password
+              </label>
+              <div className="relative">
+                <input
+                  id="password"
+                  name="password"
+                  type={showPassword ? 'text' : 'password'}
+                  autoComplete="new-password"
+                  required
+                  value={formData.password}
+                  onChange={handleChange}
+                  className="input-field pr-10"
+                />
+                <button
+                  type="button"
+                  className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                  onClick={() => setShowPassword(!showPassword)}
+                >
+                  {showPassword ? (
+                    <EyeOff className="h-5 w-5 text-gray-400" />
+                  ) : (
+                    <Eye className="h-5 w-5 text-gray-400" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <label htmlFor="confirmPassword" className="form-label">
+                Confirm password
+              </label>
+              <div className="relative">
+                <input
+                  id="confirmPassword"
+                  name="confirmPassword"
+                  type={showConfirmPassword ? 'text' : 'password'}
+                  autoComplete="new-password"
+                  required
+                  value={formData.confirmPassword}
+                  onChange={handleChange}
+                  className="input-field pr-10"
+                />
+                <button
+                  type="button"
+                  className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                  onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                >
+                  {showConfirmPassword ? (
+                    <EyeOff className="h-5 w-5 text-gray-400" />
+                  ) : (
+                    <Eye className="h-5 w-5 text-gray-400" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <button
+                type="submit"
+                disabled={isLoading}
+                className="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isLoading ? (
+                  <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                ) : (
+                  <>
+                    <UserPlus className="w-5 h-5 mr-2" />
+                    Create account
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+
+          <div className="mt-6">
+            <div className="relative">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-gray-300"></div>
+              </div>
+              <div className="relative flex justify-center text-sm">
+                <span className="px-2 bg-white text-gray-500">
+                  By signing up, you agree to our Terms and Privacy Policy
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+// File: project/src/pages/Translate.tsx
+import React from 'react';
+import DetectJSX from '../components/Detect';
+import { useNavigate } from 'react-router-dom';
+
+export default function Translate() {
+    const navigate = useNavigate();
+
+    React.useEffect(()=>{
+        if(!localStorage.getItem('token')){
+            navigate('/login')
+        }
+    }, [navigate]);
+
+    return (
+        <div className="min-h-screen bg-gray-50 py-12">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div className="max-w-4xl mx-auto">
+                    <div className="bg-white shadow-xl rounded-lg overflow-hidden">
+                        <DetectJSX/>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+// File: project/src/services/api.ts
+import axios from 'axios';
+
+const API_URL = 'http://localhost:5555/api';
+
+const api = axios.create({
+  baseURL: API_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// Add token to requests if it exists
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// api.ts - update return types
+export const authApi = {
+  login: async (email: string, password: string): Promise<{ user: User; token: string }> => {
+    const response = await api.post('/auth/login', { email, password });
+    return response.data;
+  },
+  
+  register: async (fullName: string, email: string, password: string): Promise<{ user: User; token: string }> => {
+    const response = await api.post('/auth/register', { fullName, email, password });
+    return response.data;
+  },
+  forgotPassword: async (email: string) => {
+    const response = await api.post('/auth/forgot-password', { email });
+    return response.data;
+  },
+  resetPassword: async (token: string, password: string) => {
+    const response = await api.post('/auth/reset-password', { token, password });
+    return response.data;
+  },
+};
+
+export const userApi = {
+  getProfile: async () => {
+    const response = await api.get('/user');
+    return response.data;
+  },
+  updateProfile: async (userData: any) => {
+    const response = await api.put('/user', userData);
+    return response.data;
+  },
+  updatePassword: async (passwordData: any) => {
+    const response = await api.put('/user/password', passwordData);
+    return response.data;
+  },
+};
+// File: project/src/store/index.ts
+import { configureStore } from '@reduxjs/toolkit';
+import authReducer from './slices/authSlice';
+import translationReducer from './slices/translationSlice';
+
+export const store = configureStore({
+  reducer: {
+    auth: authReducer,
+    translation: translationReducer,
+  },
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+// File: project/src/store/slices/authSlice.ts
+import { createSlice, PayloadAction } from '@reduxjs/toolkit';
+import { AuthState, User } from '../../types';
+
+const initialState: AuthState = {
+  user: null,
+  token: localStorage.getItem('token'),
+  isLoading: false,
+  error: null,
+};
+
+// authSlice.ts - make reducer match API response
+const authSlice = createSlice({
+  name: 'auth',
+  initialState,
+  reducers: {
+    setCredentials: (
+      state,
+      action: PayloadAction<{ user: User; token: string }>) => {
+      state.user = action.payload.user;
+      state.token = action.payload.token;
+      // console.log(action.payload.token)
+      localStorage.setItem('token', action.payload.token);
+    },
+    logout: (state) => {
+      state.user = null;
+      state.token = null;
+      localStorage.removeItem('token');
+    },
+  },
+});
+
+export const { setCredentials, logout } = authSlice.actions;
+export default authSlice.reducer;
+// File: project/src/store/slices/translationSlice.ts
+import { createSlice } from '@reduxjs/toolkit';
+
+const initialState = {
+  error: null,
+};
+
+const translationSlice = createSlice({
+  name: 'translation',
+  initialState,
+  reducers: {
+    setError: (state, action) => {
+      state.error = action.payload;
+    },
+    clearError: (state) => {
+      state.error = null;
+    },
+  },
+});
+
+export const { setError, clearError } = translationSlice.actions;
+export default translationSlice.reducer;
+// File: project/src/types/index.ts
+export interface User {
+  id: number;
+  email: string;
+  fullName: string;
+}
+
+export interface AuthState {
+  user: User | null;
+  token: string | null;
+  isLoading: boolean;
+  error: string | null;
+}
+
+export interface LoginCredentials {
+  email: string;
+  password: string;
+}
+
+export interface RegisterCredentials extends LoginCredentials {
+  fullName: string;
+  confirmPassword: string;
+}
+
+
+// File: project/src/vite-env.d.ts
+/// <reference types="vite/client" />
+
+// File: project/tailwind.config.js
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+
+// File: project/tsconfig.app.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src"]
+}
+
+// File: project/tsconfig.json
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+
+// File: project/tsconfig.node.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["vite.config.ts"]
+}
+
+// File: project/vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  optimizeDeps: {
+    exclude: ['lucide-react'],
+  },
+});
+
