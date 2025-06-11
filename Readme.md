@@ -105,4 +105,4 @@
   * Submit a pull request with a clear description.
 
 # 📄 License
-This project is licensed under the GNU 3.0 License.
+This project is licensed under the GPL 3.0 License.
