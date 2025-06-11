@@ -98,3 +98,11 @@
 ![Login Image](./Outputs/Login%20Page.png)
 
 ![SignUp Image](./Outputs/Sign%20Up%20Page.png)
+
+# 🤝 Contributing
+  * Fork the repo and create a feature branch.
+  * Write clean, modular, well-commented code.
+  * Submit a pull request with a clear description.
+
+# 📄 License
+This project is licensed under the GNU 3.0 License.
